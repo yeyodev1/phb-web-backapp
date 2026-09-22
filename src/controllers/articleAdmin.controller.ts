@@ -54,6 +54,20 @@ async function uniqueSlug(base: string, excludeId?: string): Promise<string> {
   }
 }
 
+// Publicados sin traducción al inglés vigente (para el botón "Traducir pendientes").
+// Hace falta el contenido para calcular el hash: se cachea 60 s por instancia.
+let statsCache: { at: number; value: { total: number; remaining: number } } | null = null;
+async function backlogStats() {
+  if (statsCache && Date.now() - statsCache.at < 60_000) return statsCache.value;
+  const docs = await Article.find({ isPublished: true })
+    .select("title excerpt content translations.en.status translations.en.sourceHash translations.en.title")
+    .lean();
+  const remaining = docs.filter((d) => !isFullFresh(d, d.translations?.en)).length;
+  const value = { total: docs.length, remaining };
+  statsCache = { at: Date.now(), value };
+  return value;
+}
+
 // GET /api/articles/admin  (admin) — incluye borradores y todas las fuentes
 export async function adminList(req: Request, res: Response, next: NextFunction) {
   try {
@@ -81,7 +95,8 @@ export async function adminList(req: Request, res: Response, next: NextFunction)
       return { ...rest, translation: translationInfo(a) };
     });
 
-    res.json({ data, pagination: { page, limit, total, pages: Math.ceil(total / limit) } });
+    const translationStats = await backlogStats().catch(() => undefined);
+    res.json({ data, pagination: { page, limit, total, pages: Math.ceil(total / limit) }, translationStats });
   } catch (error) {
     next(error);
   }
@@ -145,7 +160,11 @@ export async function update(req: Request, res: Response, next: NextFunction) {
       fields.slug = await uniqueSlug(String(fields.slug), String(id));
     }
 
-    const article = await Article.findByIdAndUpdate(id, { $set: fields }, { new: true, runValidators: true }).select("-__v");
+    // Si cambia el español, se reinicia el contador de intentos fallidos (texto nuevo, intentos nuevos)
+    const spanishChanged = fields.title !== undefined || fields.excerpt !== undefined || fields.content !== undefined;
+    const ops: Record<string, unknown> = { $set: fields };
+    if (spanishChanged) ops.$unset = { "translations.en.attempts": "" };
+    const article = await Article.findByIdAndUpdate(id, ops, { new: true, runValidators: true }).select("-__v");
     if (!article) {
       res.status(404).json({ message: "Article not found" });
       return;
@@ -182,6 +201,15 @@ export async function forceTranslate(req: Request, res: Response, next: NextFunc
       res.status(409).json({ message: "Ya hay una traducción en curso para este artículo" });
       return;
     }
+    if (outcome.status === "skipped") {
+      // "changed": el español cambió justo mientras se reclamaba; cualquier otro caso tampoco tradujo
+      res.status(409).json({
+        message: outcome.reason === "changed"
+          ? "El artículo cambió mientras se iniciaba la traducción; vuelve a intentarlo"
+          : "No se pudo iniciar la traducción; vuelve a intentarlo",
+      });
+      return;
+    }
     const article = await Article.findById(id).select("-__v");
     const data = withTranslation(article);
     if (outcome.status === "failed") {
@@ -199,6 +227,7 @@ export async function translateBacklog(req: Request, res: Response, next: NextFu
   try {
     const limit = Math.min(10, Math.max(1, parseInt(req.query.limit as string) || 3));
     const result = await processBacklog(limit, credsFromRequest(req));
+    statsCache = null;
     res.json({ data: result });
   } catch (error) {
     next(error);

@@ -23,13 +23,19 @@ export interface EnTranslation {
   error?: string;
   startedAt?: Date;
   failedAt?: Date;
+  attempts?: number; // intentos seguidos sin éxito (se incrementa al reclamar, vuelve a 0 al terminar bien)
+  summaryPendingAt?: Date; // bloqueo de la traducción de título/extracto del listado
+  summaryFailedAt?: Date; // último fallo de título/extracto (backoff en la base, no en memoria)
 }
 
 // Estado derivado que se muestra en el admin.
 export type AdminTranslationState = "ready" | "pending" | "stale" | "failed" | "none";
 
 export const LOCK_TTL_MS = 5 * 60 * 1000; // un "pending" más antiguo se considera abandonado
-export const FAILED_BACKOFF_MS = 10 * 60 * 1000; // tras un fallo no se reintenta en automático durante 10 min
+export const FAILED_BACKOFF_MS = 10 * 60 * 1000; // backoff base tras un fallo (se duplica en cada intento)
+export const MAX_AUTO_ATTEMPTS = 4; // después de 4 intentos fallidos solo se reintenta forzando desde el admin
+export const SUMMARY_LOCK_MS = 60 * 1000;
+export const SUMMARY_BACKOFF_MS = 30 * 60 * 1000;
 
 function sha256(value: string): string {
   return crypto.createHash("sha256").update(value, "utf8").digest("hex");
@@ -45,8 +51,16 @@ export function hashSummary(a: ArticleSource): string {
   return sha256(`${a.title || ""}\u0000${a.excerpt || ""}`);
 }
 
+// sourceHash solo se escribe cuando una traducción completa terminó bien, así que un "pending"
+// con el mismo hash es una regeneración forzada sobre una traducción válida: se sigue sirviendo.
 export function isFullFresh(source: ArticleSource, en?: EnTranslation | null): boolean {
-  return !!en && en.status === "ready" && !!en.title && en.sourceHash === hashSource(source);
+  return (
+    !!en &&
+    (en.status === "ready" || en.status === "pending") &&
+    !!en.title &&
+    !!en.sourceHash &&
+    en.sourceHash === hashSource(source)
+  );
 }
 
 export function isSummaryFresh(source: ArticleSource, en?: EnTranslation | null): boolean {
@@ -64,10 +78,29 @@ export function isLockActive(en?: EnTranslation | null, now = Date.now()): boole
   );
 }
 
-export function isRecentlyFailed(en?: EnTranslation | null, now = Date.now()): boolean {
-  if (!en || en.status !== "failed") return false;
+// ¿Hay que esperar antes de reintentar en automático? Backoff exponencial por intentos
+// (10, 20, 40 min) y tope de MAX_AUTO_ATTEMPTS. Un "pending" abandonado (la función murió
+// sin registrar el fallo) cuenta como intento porque attempts se incrementa al reclamar.
+export function isRetryBlocked(en?: EnTranslation | null, now = Date.now()): boolean {
+  if (!en || en.status === "ready") return false;
+  const attempts = en.attempts || 0;
+  if (en.status === "failed" && attempts === 0) {
+    const at = en.failedAt || en.startedAt;
+    return !!at && now - new Date(at).getTime() < FAILED_BACKOFF_MS;
+  }
+  if (attempts === 0) return false;
+  if (attempts >= MAX_AUTO_ATTEMPTS) return true;
   const at = en.failedAt || en.startedAt;
-  return !!at && now - new Date(at).getTime() < FAILED_BACKOFF_MS;
+  const backoff = FAILED_BACKOFF_MS * 2 ** (attempts - 1);
+  return !!at && now - new Date(at).getTime() < backoff;
+}
+
+// ¿Se puede pedir ahora la traducción de título/extracto de este artículo (listado)?
+export function canTranslateSummary(en?: EnTranslation | null, now = Date.now()): boolean {
+  if (!en) return true;
+  if (en.summaryPendingAt && now - new Date(en.summaryPendingAt).getTime() < SUMMARY_LOCK_MS) return false;
+  if (en.summaryFailedAt && now - new Date(en.summaryFailedAt).getTime() < SUMMARY_BACKOFF_MS) return false;
+  return true;
 }
 
 export function adminTranslationState(source: ArticleSource, en?: EnTranslation | null): AdminTranslationState {
@@ -281,7 +314,9 @@ export function parseSummariesResponse(text: string, items: SummaryItem[]): Map<
     if (!item) continue;
     const body = parts[k + 1] || "";
     try {
-      const seg = parseArticleResponse(body, { title: "", excerpt: "" });
+      // si el extracto original está vacío, se acepta que falte <<<EXCERPT>>>
+      const expected = item.excerpt.trim() ? { title: "", excerpt: "" } : { title: "" };
+      const seg = parseArticleResponse(body, expected);
       if (!seg.title) continue;
       if (item.excerpt.trim() && !seg.excerpt) continue;
       result.set(item.id, { title: seg.title, excerpt: seg.excerpt || "" });

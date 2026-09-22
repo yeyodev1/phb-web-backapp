@@ -24,7 +24,9 @@ const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 const GATEWAY_URL = "https://ai-gateway.vercel.sh/v1/messages";
 
 export const CHUNK_MAX_CHARS = 20_000; // por encima se traduce por bloques
-export const MAX_CONTENT_CHARS = 200_000; // artículos más grandes no se traducen
+// Artículos más grandes no se traducen. Con trozos de 20K traducidos en paralelo, el trabajo
+// cabe holgado en el maxDuration (300 s) de la función.
+export const MAX_CONTENT_CHARS = 100_000;
 const MAX_OUTPUT_TOKENS = 16_000;
 const ARTICLE_TIMEOUT_MS = 150_000;
 
@@ -165,16 +167,18 @@ export async function translateArticle(source: Required<TranslationSegments>, cr
   const chunks = chunkHtml(source.content, CHUNK_MAX_CHARS);
   const total = chunks.length;
 
-  const first = await translateSegments(
-    { title: source.title, excerpt: source.excerpt, content: chunks[0] },
-    creds,
-    { index: 0, total }
+  // Los trozos son independientes: se traducen en paralelo para que el tiempo total sea el
+  // de un solo trozo (una traducción secuencial podía superar el maxDuration de la función).
+  const [first, ...rest] = await Promise.all(
+    chunks.map((chunk, i) =>
+      translateSegments(
+        i === 0 ? { title: source.title, excerpt: source.excerpt, content: chunk } : { content: chunk },
+        creds,
+        { index: i, total }
+      )
+    )
   );
-  const contentParts = [first.seg.content || ""];
-  for (let i = 1; i < total; i++) {
-    const r = await translateSegments({ content: chunks[i] }, creds, { index: i, total });
-    contentParts.push(r.seg.content || "");
-  }
+  const contentParts = [first.seg.content || "", ...rest.map((r) => r.seg.content || "")];
 
   return {
     title: first.seg.title || "",

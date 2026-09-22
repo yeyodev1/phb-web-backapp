@@ -34,6 +34,9 @@ const EnTranslationSchema = new Schema(
     error: { type: String },
     startedAt: { type: Date },
     failedAt: { type: Date },
+    attempts: { type: Number },
+    summaryPendingAt: { type: Date },
+    summaryFailedAt: { type: Date },
   },
   { _id: false }
 );
