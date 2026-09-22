@@ -1,4 +1,5 @@
 import mongoose, { Schema, Document } from "mongoose";
+import { EnTranslation } from "../utils/translation.helpers";
 
 export interface IArticle extends Document {
   wpId: number;
@@ -13,9 +14,29 @@ export interface IArticle extends Document {
   tags: string[];
   source: string; // "drjuangarza" | "phb"
   isPublished: boolean;
+  // Traducciones automáticas generadas a partir del texto en español (nunca se editan a mano).
+  translations?: { en?: EnTranslation };
   createdAt: Date;
   updatedAt: Date;
 }
+
+// Traducción al inglés embebida en el mismo documento (no se duplica el artículo).
+const EnTranslationSchema = new Schema(
+  {
+    title: { type: String, default: "" },
+    excerpt: { type: String, default: "" },
+    content: { type: String, default: "" },
+    sourceHash: { type: String, default: "" },
+    summaryHash: { type: String, default: "" },
+    status: { type: String, enum: ["ready", "pending", "failed"] },
+    model: { type: String, default: "" },
+    translatedAt: { type: Date },
+    error: { type: String },
+    startedAt: { type: Date },
+    failedAt: { type: Date },
+  },
+  { _id: false }
+);
 
 const ArticleSchema = new Schema<IArticle>(
   {
@@ -31,6 +52,15 @@ const ArticleSchema = new Schema<IArticle>(
     tags: [{ type: String }],
     source: { type: String, default: "drjuangarza", enum: ["drjuangarza", "phb"] },
     isPublished: { type: Boolean, default: true },
+    translations: {
+      type: new Schema(
+        {
+          en: { type: EnTranslationSchema, default: undefined },
+        },
+        { _id: false }
+      ),
+      default: undefined,
+    },
   },
   {
     timestamps: true,
