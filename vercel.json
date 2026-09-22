@@ -11,5 +11,11 @@
       "source": "/(.*)",
       "destination": "src/index.ts"
     }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/translate-backlog",
+      "schedule": "*/15 * * * *"
+    }
   ]
 }
