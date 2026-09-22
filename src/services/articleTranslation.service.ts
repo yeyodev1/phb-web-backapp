@@ -24,7 +24,8 @@ import {
 
 // Orquestación de la traducción automática al inglés de los artículos:
 // bloqueo atómico en Mongo, trabajos en segundo plano, lotes para el listado y backlog.
-// El texto en español nunca se modifica aquí; solo se escribe en translations.en.
+// El texto en español nunca se modifica aquí; solo se escribe en translations.en
+// (con timestamps: false para no alterar updatedAt del artículo).
 
 const MAX_BACKGROUND_JOBS = 3; // trabajos simultáneos por instancia
 const MAX_SCHEDULED_PER_REQUEST = 3;
@@ -91,7 +92,7 @@ export async function translateArticleNow(
   const claimed = await Article.findOneAndUpdate(
     filter,
     { $set: { "translations.en.status": "pending", "translations.en.startedAt": startedAt } },
-    { new: true, projection: { _id: 1 } }
+    { new: true, projection: { _id: 1 }, timestamps: false }
   ).lean();
 
   if (!claimed) {
@@ -120,7 +121,7 @@ export async function translateArticleNow(
         "translations.en.translatedAt": new Date(),
       },
       $unset: { "translations.en.error": "", "translations.en.failedAt": "" },
-    });
+    }, { timestamps: false });
     return { status: "ready", model: t.model };
   } catch (err: any) {
     const message = String(err?.message || err).slice(0, 500);
@@ -131,7 +132,7 @@ export async function translateArticleNow(
         "translations.en.error": message,
         "translations.en.failedAt": new Date(),
       },
-    }).catch(() => {});
+    }, { timestamps: false }).catch(() => {});
     return { status: "failed", error: message };
   }
 }
@@ -207,6 +208,7 @@ export async function localizeListItems(items: ListItem[], creds: LlmCredentials
                 "translations.en.summaryHash": hashSummary(it),
               },
             },
+            timestamps: false,
           },
         });
       }
