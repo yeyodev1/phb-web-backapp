@@ -2,6 +2,15 @@ import { Request, Response, NextFunction } from "express";
 import mongoose from "mongoose";
 import { Article } from "../models/Article";
 import { slugify } from "../utils/slugify";
+import { isFullFresh } from "../utils/translation.helpers";
+import {
+  credsFromRequest,
+  processBacklog,
+  scheduleTranslation,
+  translateArticleNow,
+  translationInfo,
+} from "../services/articleTranslation.service";
+import { hasLlmCredentials } from "../services/translation.service";
 
 const SOURCES = ["drjuangarza", "phb"];
 
@@ -24,6 +33,12 @@ function pickFields(body: Record<string, unknown>) {
   }
   if (typeof out.slug === "string") out.slug = slugify(out.slug);
   return out;
+}
+
+// Añade el estado de la traducción al inglés (para el admin).
+function withTranslation(article: any) {
+  const json = typeof article?.toJSON === "function" ? article.toJSON() : article;
+  return { ...json, translation: translationInfo(json) };
 }
 
 async function uniqueSlug(base: string, excludeId?: string): Promise<string> {
@@ -56,11 +71,17 @@ export async function adminList(req: Request, res: Response, next: NextFunction)
     if (search) query.title = { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), $options: "i" };
 
     const [articles, total] = await Promise.all([
-      Article.find(query).sort({ date: -1 }).skip(skip).limit(limit).select("-content -__v"),
+      // content se necesita para saber si la traducción está al día; se quita de la respuesta
+      Article.find(query).sort({ date: -1 }).skip(skip).limit(limit).select("-__v -translations.en.content -translations.en.excerpt").lean(),
       Article.countDocuments(query),
     ]);
 
-    res.json({ data: articles, pagination: { page, limit, total, pages: Math.ceil(total / limit) } });
+    const data = articles.map((a: any) => {
+      const { content: _content, ...rest } = a;
+      return { ...rest, translation: translationInfo(a) };
+    });
+
+    res.json({ data, pagination: { page, limit, total, pages: Math.ceil(total / limit) } });
   } catch (error) {
     next(error);
   }
@@ -79,7 +100,7 @@ export async function adminGet(req: Request, res: Response, next: NextFunction) 
       res.status(404).json({ message: "Article not found" });
       return;
     }
-    res.json({ data: article });
+    res.json({ data: withTranslation(article) });
   } catch (error) {
     next(error);
   }
@@ -100,7 +121,8 @@ export async function create(req: Request, res: Response, next: NextFunction) {
     if (fields.isPublished === undefined) fields.isPublished = true;
 
     const article = await Article.create(fields);
-    res.status(201).json({ data: article });
+    if (article.isPublished) scheduleTranslation(String(article._id), credsFromRequest(req));
+    res.status(201).json({ data: withTranslation(article) });
   } catch (error) {
     next(error);
   }
@@ -128,7 +150,56 @@ export async function update(req: Request, res: Response, next: NextFunction) {
       res.status(404).json({ message: "Article not found" });
       return;
     }
-    res.json({ data: article });
+    // Si el español cambió (o se publicó) y la traducción no está al día, se regenera en segundo plano
+    if (article.isPublished && !isFullFresh(article, article.translations?.en)) {
+      scheduleTranslation(String(article._id), credsFromRequest(req));
+    }
+    res.json({ data: withTranslation(article) });
+  } catch (error) {
+    next(error);
+  }
+}
+
+// POST /api/articles/admin/:id/translate  (admin) — fuerza (re)traducir y espera el resultado
+export async function forceTranslate(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { id } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      res.status(404).json({ message: "Article not found" });
+      return;
+    }
+    const creds = credsFromRequest(req);
+    if (!hasLlmCredentials(creds)) {
+      res.status(503).json({ message: "Traducción no disponible: faltan credenciales del LLM" });
+      return;
+    }
+    const outcome = await translateArticleNow(String(id), creds, { force: true });
+    if (outcome.status === "skipped" && outcome.reason === "not-found") {
+      res.status(404).json({ message: "Article not found" });
+      return;
+    }
+    if (outcome.status === "skipped" && outcome.reason === "locked") {
+      res.status(409).json({ message: "Ya hay una traducción en curso para este artículo" });
+      return;
+    }
+    const article = await Article.findById(id).select("-__v");
+    const data = withTranslation(article);
+    if (outcome.status === "failed") {
+      res.status(502).json({ message: `La traducción falló: ${outcome.error}`, data });
+      return;
+    }
+    res.json({ data });
+  } catch (error) {
+    next(error);
+  }
+}
+
+// POST /api/articles/admin/translate-backlog?limit=N  (admin) — traduce hasta N (máx 10)
+export async function translateBacklog(req: Request, res: Response, next: NextFunction) {
+  try {
+    const limit = Math.min(10, Math.max(1, parseInt(req.query.limit as string) || 3));
+    const result = await processBacklog(limit, credsFromRequest(req));
+    res.json({ data: result });
   } catch (error) {
     next(error);
   }
